@@ -17,6 +17,7 @@
 #include "../utils/mut.h"
 
 #if SINGELI_SIMD
+  #include <math.h>  // For INFINITY
   #define SINGELI_FILE fold
   #include "../utils/includeSingeli.h"
 #endif
@@ -343,9 +344,29 @@ B insert_c1(Md1D* d, B x) { B f = d->f;
   if (len==1) return C1(select, x);
   if (RARE(!isFun(f))) { decG(x); if (isMd(f)) thrM("Calling a modifier"); return inc(f); }
   ur xr = RNK(x);
-  if (xr==1 && isPervasiveDyExt(f)) return m_unit(fold_c1(d, x));
+  u8 rtid = v(f)->flags-1;
+  if (isPervasiveDyExt(f)) {
+    if (RNK(x)==1) return m_unit(fold_c1(d, x));
+    u8 xe = TI(x,elType);
+    if (rtid == n_floor && elNum(xe) && xe!=el_bit) {
+      usz wd = elWidth(xe);
+      usz* xsh = SH(x);
+      usz c = shProd(xsh, 1, xr);
+      if (c*wd <= 6*32) {
+        Arr* r; void* rp = m_tyarrp(&r,elWidth(xe),c,el2t(xe));
+        if (xr>2) {
+          ShArr* rsh = m_shArr(xr-1);
+          shcpy(rsh->a, xsh+1, xr-1);
+          arr_shSetUG(r, xr-1, rsh);
+        } else {
+          arr_shVec(r);
+        }
+        avx2_insert_min[xe-el_i8](rp, tyany_ptr(x), xsh[0], c);
+        decG(x); return taga(r);
+      }
+    }
+  }
   if (v(f)->flags) {
-    u8 rtid = v(f)->flags-1;
     if (rtid==n_ltack) return C1(select, x);
     if (rtid==n_rtack) return C2(select, m_f64(-1), x);
     if (rtid==n_join) {
