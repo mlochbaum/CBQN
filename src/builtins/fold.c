@@ -17,7 +17,6 @@
 #include "../utils/mut.h"
 
 #if SINGELI
-  #include <math.h>  // For INFINITY
   #define SINGELI_FILE fold
   #include "../utils/includeSingeli.h"
 #endif

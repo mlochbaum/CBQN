@@ -91,7 +91,7 @@ def insert_assoc_reg{T, op, id:T, x0:*void, len:u64, wid:u64} = {
   li  := (rem-1)/vw
   last:= homBlend{idv, load{*V~~end, li}, maskOf{V, rem-li*vw}}
   def id_labels = @collect (n) makelabel{}
-  each{{g} => each{g, iota{n}, rv, id_labels}, tup{
+  each{each{., iota{n}, rv, id_labels}, tup{
     # Read or use last vector
     {i, v, lbl} => {
       if (i<n-1 and i<li) { v = load{*V~~end, i} }
@@ -143,7 +143,7 @@ def insert_assoc_finish{op, idv:I, rv, set:u64, ws:u64} = {
         def i = iota{min{2*(m+1), n-m}}  # Vectors to change
         {a, b} := tupsel{tup{i+m, i+m+1}, merge{rv, tup{idv}}}
         if (has_lanes) {
-          h := each{{a,b}=>shufHalves{a,b, 16b21}, a,b}
+          h := each{shufHalves{., ., 16b21}, a,b}
           if (o<ls) b = h; else a = h
         }
         def shift_op{r, a,b, i} = {
@@ -215,13 +215,13 @@ fn insert_assoc{T, op, id0}(r0:*void, x0:*void, len:u64, wid:u64) : void = {
       end := xc + len*wid
       last := xc + wid - nvw
       while (1) {
-        rv := each{bind{load, *V~~xc}, i}
+        rv := each{load{*V~~xc, .}, i}
         x := xc + wid
         while (x < end) {
           rv = each{{v,i} => op{v, load{*V~~x, i}}, rv, i}
           x += wid
         }
-        each{bind{store, *V~~r}, i, rv}
+        each{store{*V~~r, ...}, i, rv}
         xc += nvw; r += nvw
         if (rare{xc > last}) {
           if (xc == last+nvw) return{}
@@ -233,7 +233,7 @@ fn insert_assoc{T, op, id0}(r0:*void, x0:*void, len:u64, wid:u64) : void = {
   }
 }
 
-def maxvalue{T==f64} = 'INFINITY'
+def maxvalue{T==f64} = 1/0
 exportT{
   'simd_insert_min',
   each{{T} => insert_assoc{T, min, maxvalue{T}}, tup{i8,i16,i32,f64}}
