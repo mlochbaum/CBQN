@@ -3,6 +3,7 @@ include './cbqnDefs'
 include './f64'
 include './mask'
 include './bitops'
+include './bmi'
 
 def avx2 = hasarch{'AVX2'}
 def has_vec{T} = match(width{T}) { {64}=>hasarch{'AARCH64'}; {128}=>1 }
@@ -463,3 +464,58 @@ def tr_kernels = if (not avx2) tup{ 8,     8,      4,   0 }
 export_tab{'simd_transpose', each{transpose, tr_types, tr_kernels}}
 
 export_tab{'interleave_fns', each{interleave, tr_types}}
+
+
+# Bit matrix transpose
+
+# Transpose squares of side length 1<<s assuming stride l
+def bit_sub_transpose{l, s, b0} = if (s==0) b0 else {
+  def k = s-1; def b = bit_sub_transpose{l, k, b0}
+  def w = width{type{b}}
+  # Select top-right corner: bits that are 0 in the leading dimension
+  # and 1 in the trailing dimension at scale k
+  def m = base{2, iota{w}&((l+1)<<k) == 1<<k}
+  # Shift up in leading dim and down in trailing moves to bottom-left
+  def sh = (l-1)<<k
+  # Swap the two corners
+  t := (b ^ (b>>sh)) & m
+  b ^ (t | t<<sh)
+}
+def bit_transpose{ll, b} = bit_sub_transpose{1<<ll, ll, b}
+
+def bit_transpose{ll, b0 if hasarch{'BMI2'} and ll==3} = {
+  def w = 1<<(2*ll)
+  def lo = ty_u{w}~~base{4, (w/2)**1}
+  def shuf{b} = pext{b, lo} | pext{b, lo<<1}<<(w/2)  # perfect shuffle
+  def tr{k} = if (k==0) b0 else shuf{tr{k-1}}
+  tr{ll}
+}
+
+# Transpose kernel of size kw,kh in size w,h array
+def kernel{xp:*void, xi, rp:*void, ri, kw==8, kh==8, w, h} = {
+  def loc{ptr, i} = tup{*u16~~(*u8~~ptr + i/8), i%8}
+  b:u64 = 0
+  @unroll (i to 8) {
+    def {p, sh} = loc{xp, xi + w*i}
+    b |= promote{u64, cast_i{u8, load{p} >> sh}} << (8*i)
+  }
+  b = bit_transpose{3, b}
+  @unroll (i to 8) {
+    def {p, sh} = loc{rp, ri + h*i}
+    s := promote{u16, cast_i{u8, b >> (8*i)}}
+    store{p, 0, (load{p} &~ (u16~~0xff << sh)) | (s << sh)}
+  }
+}
+
+fn transpose_bit(rp:*void, xp:*void, w:u64, h:u64, ws:u64, hs:u64) : void = {
+  def at{x,y} = tup{xp, y*ws + x, rp, x*hs + y}
+  def k = 8
+  he := h + (-h)%k
+  we := w + (-w)%k
+  @for_mult_max{k, h-k} (y to he) {
+    @for_mult_max{k, w-k} (x to we) {
+      kernel{...at{x,y}, k, k, ws, hs}
+    }
+  }
+}
+export{'si_transpose_bit', transpose_bit}

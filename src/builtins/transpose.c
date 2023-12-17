@@ -201,7 +201,15 @@ static Arr* transpose_noshape(B* px, usz ia, usz w, usz h) {
       bit_cpyN(r0, h, r1, 0, h);
       TFREE(r1);
     #endif
-    } else {
+    } else
+    #if SINGELI
+    if (w>=8 && h>=8) {
+      u64* xp = bitarr_ptr(x);
+      u64* r0; r=m_bitarrp(&r0, ia);
+      si_transpose_bit(r0, xp, w, h, w, h);
+    } else
+    #endif
+    {
       *px = x = taga(cpyI8Arr(x)); xe=el_i8;
       void* rv = m_tyarrp(&r,elWidth(xe),ia,el2t(xe));
       void* xv = tyany_ptr(x);
