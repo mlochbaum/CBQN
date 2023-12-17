@@ -468,54 +468,99 @@ export_tab{'interleave_fns', each{interleave, tr_types}}
 
 # Bit matrix transpose
 
-# Transpose squares of side length 1<<s assuming stride l
-def bit_sub_transpose{l, s, b0} = if (s==0) b0 else {
-  def k = s-1; def b = bit_sub_transpose{l, k, b0}
-  def w = width{type{b}}
-  # Select top-right corner: bits that are 0 in the leading dimension
-  # and 1 in the trailing dimension at scale k
-  def m = base{2, iota{w}&((l+1)<<k) == 1<<k}
-  # Shift up in leading dim and down in trailing moves to bottom-left
-  def sh = (l-1)<<k
-  # Swap the two corners
-  t := (b ^ (b>>sh)) & m
-  b ^ (t | t<<sh)
+def bit_swap_axes{words, a, b if a<b} = {
+  def w = lb{width{type{select{words,0}}}}
+  def d = b - a
+  # Swap bits m with m<<sh
+  def swap{v, sh, m} = {
+    def t = (v ^ (v>>sh)) & m
+    v ^ (t | t<<sh)
+  }
+  if (a < w) {
+    # Strides in both dimensions
+    def sa = 1<<a; def sb = 1<<b
+    # Select top-right corner: 0 in axis b and 1 in a
+    def m = base{2, iota{1<<w}&(sb|sa) == sa}
+    if (b < w) { # Swap within words: slower!
+      # Shift up along b and down along a to get to bottom-left
+      each{swap{., sb - sa, m}, words}
+    } else {
+      # Shifting along a is normal but b moves between words
+      def swap_inplace{u, v} = {
+        def t = (u ^ (v<<sa)) & m
+        u ^= t; v ^= t>>sa
+      }
+      wr := words; each{swap_inplace, ...pairs{sb>>w, wr}}; wr
+    }
+  } else {
+    def i = iota{length{words}}
+    select{words, swap{i, d, 1<<(a-w)}}
+  }
 }
-def bit_transpose{ll, b} = bit_sub_transpose{1<<ll, ll, b}
 
-def bit_transpose{ll, b0 if hasarch{'BMI2'} and ll==3} = {
+# Transpose bit matrix of side length 1<<l
+def bit_transpose{l, b} = {
+  def tr{s, b0} = if (s==0) b0 else {
+    def k = s-1
+    bit_swap_axes{tr{k, b0}, k, l+k}
+  }
+  tr{l, b}
+}
+
+def bit_transpose{ll==3, {b0} if hasarch{'BMI2'} and ll==3} = {
   def w = 1<<(2*ll)
   def lo = ty_u{w}~~base{4, (w/2)**1}
   def shuf{b} = pext{b, lo} | pext{b, lo<<1}<<(w/2)  # perfect shuffle
   def tr{k} = if (k==0) b0 else shuf{tr{k-1}}
-  tr{ll}
+  tup{tr{ll}}
+}
+
+def load_k_bit{T, loc, xi, w, kw, kh} = {
+  def q = width{T} / kw
+  def R = ty_u{kw}; def E = ty_u{2*kw}
+  def getb{base} = {
+    b:T = 0
+    @unroll (i to q) {
+      def {p, sh} = loc{E, base + w*i}
+      b |= promote{T, cast_i{R, load{p} >> sh}} << (kw*i)
+    }
+    b
+  }
+  each{{j}=>getb{xi + w*j}, q*iota{kh/q}}
+}
+def store_k_bit{T, loc, ri, h, kw, kh, b} = {
+  def q = width{T} / kh
+  def R = ty_u{kh}; def E = ty_u{2*kh}; def mh = E~~(1<<kh - 1)
+  def storeb{b, ri} = {
+    @unroll (i to q) {
+      def {p0, sh} = loc{E, ri + h*i}; def p = *E~~p0
+      s := promote{E, cast_i{R, b >> (kh*i)}}
+      store{p, 0, (load{p} &~ (mh << sh)) | (s << sh)}
+    }
+  }
+  each{{j,v}=>storeb{v, ri + h*j}, q*iota{kw/q}, b}
 }
 
 # Transpose kernel of size kw,kh in size w,h array
-def kernel{xp:*void, xi, rp:*void, ri, kw==8, kh==8, w, h} = {
-  def loc{ptr, i} = tup{*u16~~(*u8~~ptr + i/8), i%8}
-  b:u64 = 0
-  @unroll (i to 8) {
-    def {p, sh} = loc{xp, xi + w*i}
-    b |= promote{u64, cast_i{u8, load{p} >> sh}} << (8*i)
-  }
-  b = bit_transpose{3, b}
-  @unroll (i to 8) {
-    def {p, sh} = loc{rp, ri + h*i}
-    s := promote{u16, cast_i{u8, b >> (8*i)}}
-    store{p, 0, (load{p} &~ (u16~~0xff << sh)) | (s << sh)}
-  }
+def kernel{xp:*void, xi, rp:*void, ri, kw, kh==kw, w, h} = {
+  def loc{T, ptr, i} = tup{*T~~(ptr + i/8), i%8}
+  def loc{ptr} = loc{., *u8~~ptr, .}
+  def xv = load_k_bit{u64, loc{xp}, xi, w, kw, kh}
+  def xt = bit_transpose{lb{kw}, xv}
+  store_k_bit{u64, loc{rp}, ri, h, kw, kh, xt}
 }
 
 fn transpose_bit(rp:*void, xp:*void, w:u64, h:u64, ws:u64, hs:u64) : void = {
   def at{x,y} = tup{xp, y*ws + x, rp, x*hs + y}
-  def k = 8
-  he := h + (-h)%k
-  we := w + (-w)%k
-  @for_mult_max{k, h-k} (y to he) {
-    @for_mult_max{k, w-k} (x to we) {
-      kernel{...at{x,y}, k, k, ws, hs}
+  def run{k} = {
+    he := h + (-h)%k
+    we := w + (-w)%k
+    @for_mult_max{k, h-k} (y to he) {
+      @for_mult_max{k, w-k} (x to we) {
+        kernel{...at{x,y}, k, k, ws, hs}
+      }
     }
   }
+  if (w>=16 and h>=16) run{16} else run{8}
 }
 export{'si_transpose_bit', transpose_bit}
