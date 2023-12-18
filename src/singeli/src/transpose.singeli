@@ -497,15 +497,13 @@ def bit_swap_axes{words, a, b if a<b} = {
     select{words, swap{i, d, 1<<(a-w)}}
   }
 }
+def bit_swaps = match {
+  {x, {}} => x
+  {x, {s, ...r}} => bit_swaps{bit_swap_axes{x, ...s}, r}
+}
 
 # Transpose bit matrix of side length 1<<l
-def bit_transpose{l, b} = {
-  def tr{s, b0} = if (s==0) b0 else {
-    def k = s-1
-    bit_swap_axes{tr{k, b0}, k, l+k}
-  }
-  tr{l, b}
-}
+def bit_transpose{l, b} = bit_swaps{b, each{tup, iota{l}, l+iota{l}}}
 
 def bit_transpose{ll==3, {b0} if hasarch{'BMI2'} and ll==3} = {
   def w = 1<<(2*ll)
@@ -513,6 +511,18 @@ def bit_transpose{ll==3, {b0} if hasarch{'BMI2'} and ll==3} = {
   def shuf{b} = pext{b, lo} | pext{b, lo<<1}<<(w/2)  # perfect shuffle
   def tr{k} = if (k==0) b0 else shuf{tr{k-1}}
   tup{tr{ll}}
+}
+
+def bit_transpose{ll==4, b0 if hasarch{'BMI2'}} = {
+  def w = 64
+  def lo = u64~~base{4, (w/2)**1}
+  def pack{a, b, m} = pext{a, m} | pext{b, m}<<(w/2)
+  def shuf{b} = {  # perfect shuffle
+    def packs{m} = each{pack{..., m}, ...pairs{1,b}}
+    merge{packs{lo}, packs{lo<<1}}
+  }
+  def tr{k} = if (k==0) b0 else shuf{tr{k-1}}
+  tr{ll}
 }
 
 def load_k_bit{T, loc, xi, w, kw, kh} = {
@@ -550,17 +560,42 @@ def kernel{xp:*void, xi, rp:*void, ri, kw, kh==kw, w, h} = {
   store_k_bit{u64, loc{rp}, ri, h, kw, kh, xt}
 }
 
+# Double-height kernel: load with longest vertical axis at the end,
+# so it's already in position and only the other axes need to be swapped 
+def kernel{xp:*void, xi, rp:*void, ri, kw, kh==2*kw, w, h} = {
+  def loc{T, ptr, i} = tup{*T~~(ptr + i/8), i%8}
+  def loc{ptr} = loc{., *u8~~ptr, .}
+  def xv = {
+    def T=u64
+    def q = width{T} / kw
+    def R = ty_u{kw}; def E = ty_u{2*kw}
+    def getb{base} = {
+      b:T = 0
+      @unroll (i to q/2) {
+        def {p, sh} = loc{xp}{E, base + w*i}
+        b |= promote{T, cast_i{R, load{          p           } >> sh}} << (kw*2*i)
+        b |= promote{T, cast_i{R, load{*E~~(*u8~~p+w*(kh/16))} >> sh}} << (kw*(2*i+1))
+      }
+      b
+    }
+    each{{j}=>getb{xi + w*j}, (q/2)*iota{kh/q}}
+  }
+  def iw = iota{lb{kw}}
+  def xt = bit_swaps{xv, each{tup, iw, lb{kh}+iw}}
+  store_k_bit{u64, loc{rp}, ri, h, kw, kh, xt}
+}
+
 fn transpose_bit(rp:*void, xp:*void, w:u64, h:u64, ws:u64, hs:u64) : void = {
   def at{x,y} = tup{xp, y*ws + x, rp, x*hs + y}
-  def run{k} = {
-    he := h + (-h)%k
-    we := w + (-w)%k
-    @for_mult_max{k, h-k} (y to he) {
-      @for_mult_max{k, w-k} (x to we) {
-        kernel{...at{x,y}, k, k, ws, hs}
+  def run{kw, kh} = {
+    he := h + (-h)%kh
+    we := w + (-w)%kw
+    @for_mult_max{kh, h-kh} (y to he) {
+      @for_mult_max{kw, w-kw} (x to we) {
+        kernel{...at{x,y}, kw, kh, ws, hs}
       }
     }
   }
-  if (w>=16 and h>=16) run{16} else run{8}
+  if (w>=16 and h>=32) run{16, 32} else run{8, 8}
 }
 export{'si_transpose_bit', transpose_bit}
