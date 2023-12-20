@@ -525,36 +525,57 @@ def bit_transpose{ll==4, b0 if hasarch{'BMI2'}} = {
   tr{ll}
 }
 
-def load_k_bit{T, loc, xi, w, kw, kh} = {
-  def q = width{T} / kw
-  def R = ty_u{kw}; def E = ty_u{2*kw}
-  def getb{base} = {
-    b:T = 0
-    @unroll (i to q) {
-      def {p, sh} = loc{E, base + w*i}
-      b |= promote{T, cast_i{R, load{p} >> sh}} << (kw*i)
-    }
-    b
-  }
-  each{{j}=>getb{xi + w*j}, q*iota{kh/q}}
+# 0 for aligned; 1 for unaligned
+def bit_load{(0)}{T, p, sh} = {
+  load{*T~~p}
 }
-def store_k_bit{T, loc, ri, h, kw, kh, b} = {
-  def q = width{T} / kh
-  def R = ty_u{kh}; def E = ty_u{2*kh}; def mh = E~~(1<<kh - 1)
-  def storeb{b, ri} = {
-    @unroll (i to q) {
-      def {p0, sh} = loc{E, ri + h*i}; def p = *E~~p0
-      s := promote{E, cast_i{R, b >> (kh*i)}}
-      store{p, 0, (load{p} &~ (mh << sh)) | (s << sh)}
+def bit_load{(1)}{T, p, sh} = {
+  def wt = width{T}
+  cast_i{T, load{*ty_u{2*wt}~~p} >> sh}
+}
+def bit_store{(0)}{p, sh, v:T} = {
+  store{*T~~p, 0, v}
+}
+def bit_store{(1)}{p0, sh, v:T} = {
+  def wt = width{T}
+  def E = ty_u{2*wt}
+  def mh = E~~(1<<wt - 1)
+  p := *E~~p0
+  store{p, 0, (load{p} &~ (mh << sh)) | (promote{E,v} << sh)}
+}
+
+def load_k_bit{T, loc, xi, w, kw, kh} = {
+  def load_row{st, R, b, i, sh} = {
+    b |= promote{T, st{R, ...loc{i}}} << sh
+  }
+  bs := each{{_}=>{b:T=0}, iota{(kw*kh)/width{T}}}
+  do_strided{T, xi, w, kw, kh, bs, load_row, bit_load}
+  bs
+}
+def store_k_bit{T, loc, ri, h, kw, kh, bs} = {
+  def store_row{st, R, b, i, sh} = {
+    st{...loc{i}, cast_i{R, b >> sh}}
+  }
+  do_strided{T, ri, h, kh, kw, bs, store_row, bit_store}
+}
+def do_strided{T, i0, str, k, ka, words, do_row, access} = {
+  def q = width{T} / k
+  def R = ty_u{k}
+  def do_all{acc} = {
+    @unroll (n to ka/q) {
+      i := i0 + str*(q*n)
+      def b = select{words, n}
+      @unroll (j to q) do_row{acc, R, b, i + str*j, k*j}
     }
   }
-  each{{j,v}=>storeb{v, ri + h*j}, q*iota{kw/q}, b}
+  if (str%8 == 0) do_all{access{0}}
+  else            do_all{access{1}}
 }
 
 # Transpose kernel of size kw,kh in size w,h array
 def kernel{xp:*void, xi, rp:*void, ri, kw, kh==kw, w, h} = {
-  def loc{T, ptr, i} = tup{*T~~(ptr + i/8), i%8}
-  def loc{ptr} = loc{., *u8~~ptr, .}
+  def loc{ptr, i} = tup{ptr + i/8, i%8}
+  def loc{ptr} = loc{*u8~~ptr, .}
   def xv = load_k_bit{u64, loc{xp}, xi, w, kw, kh}
   def xt = bit_transpose{lb{kw}, xv}
   store_k_bit{u64, loc{rp}, ri, h, kw, kh, xt}
@@ -563,22 +584,26 @@ def kernel{xp:*void, xi, rp:*void, ri, kw, kh==kw, w, h} = {
 # Double-height kernel: load with longest vertical axis at the end,
 # so it's already in position and only the other axes need to be swapped 
 def kernel{xp:*void, xi, rp:*void, ri, kw, kh==2*kw, w, h} = {
-  def loc{T, ptr, i} = tup{*T~~(ptr + i/8), i%8}
-  def loc{ptr} = loc{., *u8~~ptr, .}
+  def loc{ptr, i} = tup{ptr + i/8, i%8}
+  def loc{ptr} = loc{*u8~~ptr, .}
   def xv = {
     def T=u64
     def q = width{T} / kw
     def R = ty_u{kw}; def E = ty_u{2*kw}
-    def getb{base} = {
-      b:T = 0
-      @unroll (i to q/2) {
-        def {p, sh} = loc{xp}{E, base + w*i}
-        b |= promote{T, cast_i{R, load{          p           } >> sh}} << (kw*2*i)
-        b |= promote{T, cast_i{R, load{*E~~(*u8~~p+w*(kh/16))} >> sh}} << (kw*(2*i+1))
+    def load_all{ld} = {
+      def addb{b, base} = {
+        @unroll (i to q/2) {
+          def {p, sh} = loc{xp}{base + w*i}
+          b |= promote{T, ld{R, p          , sh}} << (kw*2*i)
+          b |= promote{T, ld{R, p+w*(kh/16), sh}} << (kw*(2*i+1))
+        }
       }
-      b
+      each{{b,j}=>addb{b, xi + w*j}, bs, (q/2)*iota{kh/q}}
     }
-    each{{j}=>getb{xi + w*j}, (q/2)*iota{kh/q}}
+    bs := each{{_}=>{b:T=0}, iota{kh/q}}
+    if (w%8 == 0) load_all{bit_load{0}}
+    else          load_all{bit_load{1}}
+    bs
   }
   def iw = iota{lb{kw}}
   def xt = bit_swaps{xv, each{tup, iw, lb{kh}+iw}}
