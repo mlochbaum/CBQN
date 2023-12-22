@@ -469,11 +469,14 @@ export_tab{'interleave_fns', each{interleave, tr_types}}
 # Bit matrix transpose
 
 def bit_swap_axes{words, a, b if a<b} = {
-  def w = lb{width{type{select{words,0}}}}
+  def T = type{select{words,0}}
+  def wv= lb{width{T}}
+  def w = if (vect{T}) lb{elwidth{T}} else wv
+  def scal{v} = if (vect{T}) T**v else v
   def d = b - a
   # Swap bits m with m<<sh
   def swap{v, sh, m} = {
-    def t = (v ^ (v>>sh)) & m
+    def t = (v ^ (v>>sh)) & scal{m}
     v ^ (t | t<<sh)
   }
   if (a < w) {
@@ -481,18 +484,26 @@ def bit_swap_axes{words, a, b if a<b} = {
     def sa = 1<<a; def sb = 1<<b
     # Select top-right corner: 0 in axis b and 1 in a
     def m = base{2, iota{1<<w}&(sb|sa) == sa}
-    if (b < w) { # Swap within words: slower!
+    if (b < wv) { # Swap within words: slower!
       # Shift up along b and down along a to get to bottom-left
-      each{swap{., sb - sa, m}, words}
+      def swv{v} = {
+        assert{b==wv-1} # TODO
+        def revb{v} = shuf{[4]u64, v, 2,3,0,1}
+        def c = vcount{T}/2
+        def t = (v ^ revb{v<<sa}) & (T~~make{T,...merge{c**m,c**0}})
+        v ^ (t | revb{t>>sa})
+      }
+      each{(if (b < w) swap{., sb - sa, m} else swv), words}
     } else {
       # Shifting along a is normal but b moves between words
       def swap_inplace{u, v} = {
-        def t = (u ^ (v<<sa)) & m
+        def t = (u ^ (v<<sa)) & scal{m}
         u ^= t; v ^= t>>sa
       }
-      wr := words; each{swap_inplace, ...pairs{sb>>w, wr}}; wr
+      wr := words; each{swap_inplace, ...pairs{sb>>wv, wr}}; wr
     }
   } else {
+    assert{a<wv}
     def i = iota{length{words}}
     select{words, swap{i, d, 1<<(a-w)}}
   }
@@ -610,6 +621,50 @@ def kernel{xp:*void, xi, rp:*void, ri, kw, kh==2*kw, w, h} = {
   store_k_bit{u64, loc{rp}, ri, h, kw, kh, xt}
 }
 
+# AVX2 32x32 kernel
+def kernel{xp:*void, xi, rp:*void, ri, kw, kh==kw, w, h if hasarch{'AVX2'} and kw==32} = {
+  def V = [8]u32
+  def tr_iota{} = tup{0}; def tr_iota{...a,i} = {def l=tr_iota{...a}; merge{l,l+1<<i}}
+  # load
+  xv := undef{V, 4}
+  vg_ind := make{V, tr_iota{3,4,0}} * V**cast_i{u32,w}
+  if (w%8 == 0) {
+    w8 := w/8; vg_ind >>= 3
+    xv = (@collect (o to 4) gather{V, *u8~~xp + xi/8 + (2*o)*w8, [8]i32~~vg_ind})
+  } else {
+    xv = (@collect (o to 4) {
+      i := vg_ind + V**cast_i{u32,xi + (2*o)*w}
+      ir:= [8]i32~~(i>>5); im:= i&V**31
+      gather{V, *u32~~xp, ir}>>im | gather{V, *u32~~xp+1, ir}<<(V**32-im)
+    })
+  }
+  # transpose
+  tr2x2 := make{[32]i8, tr_iota{2,3,0,1,4}%16}
+  def xt = bit_swaps{                # 01234deabc  initial
+    each{sel{[16]u8, ., tr2x2}, xv}, # 012de34abc  shuffle
+    each{tup, iota{3}, 7+iota{3}}    # abcde34012  other swaps
+  }
+  # store
+  def do_strided{T, i0, str, k, ka, words, do_row, access} = {
+    def q = width{T} / k
+    def R = ty_u{k}
+    def vt_ind = tr_iota{2,3,4,0,1}
+    def do_all{acc} = {
+      @unroll (j to ka) {
+        def jt = select{vt_ind, j}
+        do_row{acc, R, select{words, jt//q}, i0 + str*j, k*(jt%q)}
+      }
+    }
+    if (str%8 == 0) do_all{access{0}}
+    else            do_all{access{1}}
+  }
+  def rb = *u8~~rp
+  def store_row{st, R, b, i, sh} = {
+    st{rb + i/8, i%8, extract{re_el{R,b}, sh/kh}}
+  }
+  do_strided{V, ri, h, kh, kw, xt, store_row, bit_store}
+}
+
 fn transpose_bit(rp:*void, xp:*void, w:u64, h:u64, ws:u64, hs:u64) : void = {
   def at{x,y} = tup{xp, y*ws + x, rp, x*hs + y}
   def run{kw, kh} = {
@@ -621,6 +676,8 @@ fn transpose_bit(rp:*void, xp:*void, w:u64, h:u64, ws:u64, hs:u64) : void = {
       }
     }
   }
-  if (w>=16 and h>=32) run{16, 32} else run{8, 8}
+  if (hasarch{'AVX2'} and w>=32 and h>=32) run{32, 32}
+  else if (w>=16 and h>=32) run{16, 32}
+  else run{8, 8}
 }
 export{'si_transpose_bit', transpose_bit}
