@@ -3,6 +3,10 @@
 #include "../builtins.h"
 #include <math.h>
 
+extern double cr_pow(double x, double y);
+extern double hp_log(double w, double x);
+extern double hp_root(double w, double x);
+
 static f64 pfmod(f64 a, f64 b) {
   f64 r = fmod(a, b);
   if (a<0 != b<0 && r!=0) r+= b;
@@ -177,9 +181,9 @@ static B modint_AS(B w,   B xv) { return modint_AA(w, C2(shape, C1(fne, incG(w))
     , /*FLT_SAI*/
     , /*ANY_AS*/ if((r_f64u(o2fG(x)) & ((1ULL<<52)-1)) == 0 && elNum(we)) return num_squeeze(C2(mul, w, m_f64(1/(o2fG(x)+0))));
   )
-  GC2f("√", root , pow(x.f+0, 1.0/(w.f+0)), NOUNROLL,,,,,)
-  GC2f("⋆", pow  , pow(w.f+0, x.f), NOUNROLL,,,,,)
-  GC2f("⋆⁼",log  , log(x.f)/log(w.f), NOUNROLL,,,,,)
+  GC2f("√", root , hp_root(w.f+0, x.f+0), NOUNROLL,,,,,)
+  GC2f("⋆", pow  , cr_pow (w.f+0, x.f  ), NOUNROLL,,,,,)
+  GC2f("⋆⁼",log  , hp_log (w.f  , x.f  ), NOUNROLL,,,,,)
   static u64 const repeatNum[] = {
     [el_i8 ] = 0x0101010101010101ULL,
     [el_i16] = 0x0001000100010001ULL,
@@ -433,11 +437,11 @@ B not_c2(B t, B w, B x) {
   AR_F_TO_ARR(NAME)                            \
   thrM(CHR ": Unexpected argument types");     \
 }
-AR_F_SCALAR("÷", div  ,       w.f/(x.f+0))
-AR_F_SCALAR("⋆", pow  , pow(w.f+0, x.f))
-AR_F_SCALAR("√", root , pow(x.f+0, 1.0/(0+w.f)))
-AR_F_SCALAR("|", stile,   pfmod(x.f, w.f))
-AR_F_SCALAR("⋆⁼",log  , log(x.f)/log(w.f))
+AR_F_SCALAR("÷", div  , w.f/(x.f+0))
+AR_F_SCALAR("⋆", pow  , cr_pow(w.f+0, x.f))
+AR_F_SCALAR("√", root , hp_root(w.f+0,x.f+0))
+AR_F_SCALAR("|", stile, pfmod(x.f, w.f))
+AR_F_SCALAR("⋆⁼",log  , hp_log(w.f,x.f))
 #undef AR_F_SCALAR
 
 static f64 comb_nat(f64 k, f64 n) {

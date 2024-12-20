@@ -732,6 +732,7 @@ cachedBin‿linkerCache ← {
     ⟨"src/", "load.c", "main.c", "rtwrap.c", "vm.c", "ns.c", "nfns.c", "ffi.c"⟩
     ⟨"src/jit/", "nvm.c"⟩
     ⟨"src/utils/", "ryu.c", "utf.c", "hash.c", "file.c", "mut.c", "each.c", "bits.c"⟩
+    ⟨"src/arith/", "pow.c"⟩
   ⟩
   cbqnSrc ↩ cbqnSrc clangd.CFiles "src"
   singeliMap ← 1↓¨ ({⊑ ({"X86_64":'x'; "AARCH64":'a'; "RV64":'g'; "NONE":'g'} po.arch) ∊ 𝕩}¨ ⊑¨)⊸/ ⟨
