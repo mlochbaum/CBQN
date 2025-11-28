@@ -607,29 +607,32 @@ B slash_c1(B t, B x) {
         for (usz i=0; i<BIT_N(n); i++) {
           for (u64 v=bw[i]; RARE(v!=0); v&=v-1) *at++ = i*64 + CTZ(v);
         }
-        *at = n;
         // Fill buffer using bottom bits only
         bw[0] = 0;
         u64 ms = (1ull<<(8*s)) - 1;
         u64 c = 0, inc = 0x0101010101010101;
-        for (usz j = 0; ; j++) {
+        for (usz j = 0; j < n; j++) {
           storeu_u64(buf+s, c);
-          if (j >= n) break; // extra write for sentinel
           c+= inc;
           s+= xp[i0+j] & (wl-1);
         }
+        storeu_u64(buf+s, c-inc); // maintain sortedness if we over-read
         // Copy and fix up
         u64 o = i0*inc;
         u64 cx = (carry ^ o) & ms;
-        at = aux; u8 a = *at++;
-        if (s<wl && a==n) {
-          carry = (o + *bw) ^ cx;
+        u64* rw0 = rw;
+        u64* be = (u64*)buf+s/wl;
+        if (at == aux) {
+          if (s < wl) { // no writes this block
+            carry = (o + *bw) ^ cx;
+            continue;
+          }
         } else {
-          u64* rw0 = rw;
+          u8* ap = aux; u8 a = *ap++;
           while (1) {
             u64 bv = *bw++;
             u8 e = bv >> (64-8);
-            while (RARE(a < e)) {
+            while (RARE(a <= e)) {
               u8 xa = xp[i0+a] / wl;
               u64 av = a*inc;
               // store min(a, bv), set bv = max(a, bv)
@@ -637,15 +640,25 @@ B slash_c1(B t, B x) {
               u64 d = (av^bv)&lt;
               *rw++ = o+(bv^d); bv = av^d;
               for (usz k=0; k<xa-1; k++) *rw++ = o+av;
-              a = *at++;
+              if (ap == at) {
+                carry = o+bv;
+                if (bw > be) goto finish_block;
+                *rw++ = carry;
+                goto aux_done;
+              }
+              a = *ap++;
             }
             carry = o+bv;
-            if (e >= n) break;
+            if (bw > be) goto finish_block;
             *rw++ = carry;
           }
-          *rw0 ^= cx;
-          s %= wl;
         }
+        aux_done:;
+        while (bw < be) *rw++ = o + *bw++;
+        carry = o + *bw;
+        finish_block:;
+        *rw0 ^= cx;
+        s %= wl;
       }
       memcpy(rw, &carry, s);
       TFREE(buf); TFREE(aux);
