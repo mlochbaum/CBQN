@@ -90,22 +90,45 @@ fn indices_fill_aux(xp:*u8, buf:*u64, aux:*u8, n:usz, mask:u8) : usz = {
   }
   an
 }
+
 # Fill buffer with Indices on low bits of values from xp
 fn indices_fill_buf{wl}(xp:*u8, buf:*u8, n:usz, s:usz) : usz = {
-  def storeu{T=[_]_, p:*_, v} = store{*T~~p, 0, v}
-  def mask = wl-1
-  def {T,c0,inc} = match (wl) {
-    {8} =>                   tup{u64,    0, 64w0x01}
-    {_} => { def V = [wl]u8; tup{  V, V**0,    V**1} }
+  def storeu{T=[_]_, p:*_, v:T       } = store{*T~~p, 0, v}
+  def storeu{T=[h]E, p:*_, v:[(2*h)]E} = store{*T~~p, 0, half{v,0}}
+  def has_shuf = hasarch{'SSSE3'} or hasarch{'AARCH64'}
+  def vl = if (has_shuf) arch_defvw{}/8 else wl
+  def {scal_i, store_i} = match (wl) {
+    {8} => tup{{k}=>u64~~(64w0x01*k), storeu{u64,...}}
+    {_} => tup{**{[vl]u8,.},          storeu{[wl]u8,...}}
   }
-  c := c0
-  store{*T~~buf, 0, c}
-  @for (xp over n) {
-    storeu{T, buf+s, c}
-    c+= inc
-    s+= promote{usz, xp & mask}
+  i := scal_i{0}
+  store_i{buf, i}
+  xw := *u64~~xp
+  def masksum{x} = { def l = 64w0x01; (x & (l*(wl-1))) * l }
+  def topbyte{x} = cast_i{usz, x >> 56}
+  @for (x in xw over cdiv{n,8}) {
+    xs:= masksum{x}  # +`wl|x
+    si:= topbyte{xs}
+    b := buf + s; s += si
+    if (not (has_shuf and si <= vl)) {
+      def st{p} = { store_i{p, i}; i += scal_i{1} }
+      st{b}; @unroll (k to 7) st{b + ((xs>>(8*k))&0xff)}
+    } else {
+      # Vector binary search
+      def V = [vl]u8; def I = [vl]i8 # no u8 comparisons
+      vi := iota{I}
+      v := I~~re_el{u64,V}**xs
+      vs:= I~~(re_el{u32,v}>>8) # instead of offsetting shuffle indices
+      c2:= (shuf{[16]i8, vs, V**2} <= vi) & V**4; r:=c2
+      c1:= (shuf{[16]i8, vs, r   } <= vi) & V**2; r|=c1
+      c0:= (shuf{[16]i8, v , r   } <= vi)       ; r-=c0
+      store{*V~~b, 0, r + i}
+      i += scal_i{8}
+    }
   }
-  storeu{T, buf+s, c-inc} # maintain sortedness if we over-read
+  # Exclude counts past the end
+  q:= n%8; if (q != 0) s -= topbyte{masksum{load{xw,n/8} >> (q*8)}}
+  store_i{buf+s, i-scal_i{1}} # maintain sortedness if we over-read
   s
 }
 
