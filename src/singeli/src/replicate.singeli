@@ -1,6 +1,7 @@
 include './base'
 include './mask'
 include './spaced'
+include './cbqnDefs'
 
 def ind_types = tup{u8, u16, u32}
 def dat_types = tup{...ind_types, u64}
@@ -56,6 +57,143 @@ fn rep_by_scan{W, T}(wp:*void, xv:*void, rv:*void, s:usz) : void = {
 
 export_tab{'si_indices_scan_i32', each{ind_by_scan_i32, ind_types}}
 export_tab{'si_replicate_scan', flat_table{rep_by_scan, ind_types, dat_types}}
+
+
+# Indices with byte buffer
+# Store index of each element >mask in aux: these will need fixing up
+fn indices_fill_aux(xp:*u8, buf:*u64, aux:*u8, n:usz, mask:u8) : usz = {
+  an:usz = 0 # Number of returned indices
+  if (not has_simd) {
+    @for (xp over i to n) {
+      store{aux, an, cast_i{u8,i}}
+      an += promote{usz, xp > mask}
+    }
+  } else {
+    def vl = arch_defvw{}/8
+    def V = [vl]u8
+    def C = ty_u{vl}
+    # Vector comparisons
+    mv := V**mask
+    a:C = 0
+    @for (c in *C~~buf, x in *V~~xp over i to cdiv{n,vl}) {
+      a|= (c = hom_to_int{mv < x})
+    }
+    if (a == 0) return{0}
+    # Bits to indices
+    if (n%64 != 0) {
+      i:= n/64
+      store{buf,i, load{buf,i} & ((u64~~1<<(n%64)) - 1)}
+    }
+    @for (v in buf over i to cdiv{n, 64}) while (v!=0) {
+      store{aux, an, cast_i{u8, i*64 + ctz{v}}}; ++an; v&=v-1
+    }
+  }
+  an
+}
+# Fill buffer with Indices on low bits of values from xp
+fn indices_fill_buf{wl}(xp:*u8, buf:*u8, n:usz, s:usz) : usz = {
+  def storeu{T=[_]_, p:*_, v} = store{*T~~p, 0, v}
+  def mask = wl-1
+  def {T,c0,inc} = match (wl) {
+    {8} =>                   tup{u64,    0, 64w0x01}
+    {_} => { def V = [wl]u8; tup{  V, V**0,    V**1} }
+  }
+  c := c0
+  store{*T~~buf, 0, c}
+  @for (xp over n) {
+    storeu{T, buf+s, c}
+    c+= inc
+    s+= promote{usz, xp & mask}
+  }
+  storeu{T, buf+s, c-inc} # maintain sortedness if we over-read
+  s
+}
+
+def indices_defs{} = {
+  def B = u64; def R = B
+  def bn = 128 # keep top bit open for SWAR
+  def bot = 64w0x01; def top = bot<<7
+  o:R = 0; def off{v} = o + v; def inc_o{bn} = { o += bot*bn }
+  carry:R = 0
+  def elt_mask{s} = (u64~~1<<(8*s)) - 1
+  def Bscal{x:(u8)} = promote{B,x} * bot
+  def last{bv, bw} = cast_i{u8, bv >> (64-8)}
+  def minmax{a:(B), b:(B)} = {
+    lt:= ((b|top)-a)&top
+    lt-= lt>>7
+    d := (a^b)&lt
+    tup{b^d, a^d}
+  }
+  tup{R,B,bn, off,inc_o, carry, elt_mask, last, Bscal, minmax}
+}
+def indices_defs{if has_simd} = {
+  def B = [16]u8; def R = B
+  def bn = 256
+  def inc_o{bn} = {}; def off{v} = R**v
+  carry := R**0
+  def elt_mask{s} = iota{R} < R**cast_i{u8,s}
+  def Bscal{x:(u8)} = B**x
+  def last{bv, bw} = load{*u8~~bw,15}
+  def minmax{a:(B), b:(B)} = tup{__min{a,b}, __max{a,b}}
+  tup{R,B,bn, off,inc_o, carry, elt_mask, last, Bscal, minmax}
+}
+fn indices_i8(xp:*u8, rv:*void, xia:usz) : void = {
+  def {R,B,bn, off,inc_o, carry, elt_mask,last,Bscal,minmax} = indices_defs{}
+  def wl = width{B}/width{u8}
+  def buflen = (wl-1)*bn + 2*wl
+  aux := talloc{u8, bn+buflen}
+  buf := *B~~(aux + bn)
+  res := *R~~rv
+  s:usz = 0
+  do {
+    n := xia; if (n>bn) n = bn
+    an := indices_fill_aux(xp, *u64~~buf, aux, n, wl-1)
+    cx := (carry ^ off{0}) & elt_mask{s}
+    s = indices_fill_buf{wl}(xp, *u8~~buf, n, s)
+    rw0 := res
+    b := buf; be := b + s/wl
+    if (an == 0) {
+      if (s < wl) { # no writes this block
+        carry = off{load{b}} ^ cx
+        goto{'continue'}
+      }
+    } else {
+      ai:usz = 0; a := load{aux, ai}
+      while (1) {
+        bv := load{b}; e := last{bv,b}; ++b
+        def fin{} = {
+          carry = off{bv}
+          if (b > be) goto{'finish_block'}
+          store{res, 0, carry}; ++res
+        }
+        while (rare{a <= e}) { # expansion needed
+          xa := load{xp, a} / wl
+          av := Bscal{a}
+          def {mm,mx} = minmax{av, bv}
+          store{res, 0, off{mm}}; bv = mx
+          avo := off{av}; @for (res over _ from 1 to xa) res = avo
+          res += xa
+          ++ai; if (ai == an) { fin{}; goto{'aux_done'} }
+          a = load{aux, ai}
+        }
+        fin{}
+      }
+    }
+    setlabel{'aux_done'} # fast path when remainder is bounded
+    l:= be-b; @for (res, b over l) res = off{b}
+    res += l
+    carry = off{load{be}}
+    setlabel{'finish_block'}
+    store{rw0, 0, load{rw0} ^ cx}
+    s %= wl
+    setlabel{'continue'}
+    xia -= n; xp += bn; inc_o{bn}
+  } while (xia > 0)
+  cp:*R = tup{carry}
+  emit{void, 'memcpy', res, cp, s}
+  tfree{aux}
+}
+export{'si_indices_i8', indices_i8}
 
 
 # Constant replicate

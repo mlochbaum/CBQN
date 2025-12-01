@@ -590,81 +590,11 @@ B slash_c1(B t, B x) {
       for (u64 j = 0; j < c; j++) *rp++ = i;
     }
   } else {
-    if (xe == el_i8 && xia <= 128) {
-      usz bn = 64; usz wl = 8;
-      TALLOC(u8, buf, (wl-1)*bn + 2*wl);
-      TALLOC(u8, aux, bn+1);
-      u8* xp = (u8*)i8any_ptr(x);
-      i8* rp; r = m_i8arrv(&rp, s); u64* rw = (u64*)rp;
-      usz s = 0; u64 carry = 0;
-      for (usz i0 = 0; i0 < xia; i0 += bn) {
-        usz n = xia-i0; if (n>bn) n = bn;
-        // Indices of entries with top bits to be fixed up
-        u64* bw = (u64*)buf;
-        CMP_AS_IMM(ge, el_i8, bw, xp + i0, m_usz(wl), n);
-        if (n%64) bw[n/64] &= (1ull<<(n%64)) - 1;
-        u8* at = aux;
-        for (usz i=0; i<BIT_N(n); i++) {
-          for (u64 v=bw[i]; RARE(v!=0); v&=v-1) *at++ = i*64 + CTZ(v);
-        }
-        // Fill buffer using bottom bits only
-        bw[0] = 0;
-        u64 ms = (1ull<<(8*s)) - 1;
-        u64 c = 0, inc = 0x0101010101010101;
-        for (usz j = 0; j < n; j++) {
-          storeu_u64(buf+s, c);
-          c+= inc;
-          s+= xp[i0+j] & (wl-1);
-        }
-        storeu_u64(buf+s, c-inc); // maintain sortedness if we over-read
-        // Copy and fix up
-        u64 o = i0*inc;
-        u64 cx = (carry ^ o) & ms;
-        u64* rw0 = rw;
-        u64* be = (u64*)buf+s/wl;
-        if (at == aux) {
-          if (s < wl) { // no writes this block
-            carry = (o + *bw) ^ cx;
-            continue;
-          }
-        } else {
-          u8* ap = aux; u8 a = *ap++;
-          while (1) {
-            u64 bv = *bw++;
-            u8 e = bv >> (64-8);
-            while (RARE(a <= e)) {
-              u8 xa = xp[i0+a] / wl;
-              u64 av = a*inc;
-              // store min(a, bv), set bv = max(a, bv)
-              u64 top=inc<<7, lt = ((bv|top)-av)&top; lt-=lt>>7;
-              u64 d = (av^bv)&lt;
-              *rw++ = o+(bv^d); bv = av^d;
-              for (usz k=0; k<xa-1; k++) *rw++ = o+av;
-              if (ap == at) {
-                carry = o+bv;
-                if (bw > be) goto finish_block;
-                *rw++ = carry;
-                goto aux_done;
-              }
-              a = *ap++;
-            }
-            carry = o+bv;
-            if (bw > be) goto finish_block;
-            *rw++ = carry;
-          }
-        }
-        aux_done:;
-        while (bw < be) *rw++ = o + *bw++;
-        carry = o + *bw;
-        finish_block:;
-        *rw0 ^= cx;
-        s %= wl;
-      }
-      memcpy(rw, &carry, s);
-      TFREE(buf); TFREE(aux);
-    } else
     #if SINGELI
-    if (s/32 <= xia) { // Sparse case: type of x matters
+    if (xe == el_i8 && xia <= 128) {
+      i8* rp; r = m_i8arrv(&rp, s);
+      si_indices_i8(tyany_ptr(x), rp, xia);
+    } else if (s/32 <= xia) { // Sparse case: type of x matters
       i32* rp; r = m_i32arrv(&rp, s);
       si_indices_scan_i32[elwByteLog(xe)](tyany_ptr(x), rp, s);
     } else
