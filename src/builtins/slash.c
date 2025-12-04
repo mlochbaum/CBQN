@@ -574,6 +574,12 @@ B slash_c1(B t, B x) {
   if (xe!=el_bit && s<=xia) x = squeeze_numTry(x, &xe, SQ_NUM);
   if (xe==el_bit) {
     r = where(x, xia, s);
+  #if SINGELI
+  } else if (xe == el_i8) {
+    u8 t = (xia>128) + (xia>32768) + (xia > (usz)I32_MAX+1);
+    void* rv = m_tyarrv(&r, 1<<t, s, el2t(el_i8+t));
+    si_indices[t](tyany_ptr(x), rv, xia);
+  #endif
   } else if (RARE(xia > (usz)I32_MAX+1)) {
     SGetU(x)
     f64* rp; r = m_f64arrv(&rp, s); usz ri = 0;
@@ -591,10 +597,7 @@ B slash_c1(B t, B x) {
     }
   } else {
     #if SINGELI
-    if (xe == el_i8 && xia <= 128) {
-      i8* rp; r = m_i8arrv(&rp, s);
-      si_indices_i8(tyany_ptr(x), rp, xia);
-    } else if (s/32 <= xia) { // Sparse case: type of x matters
+    if (s/32 <= xia) { // Sparse case: type of x matters
       i32* rp; r = m_i32arrv(&rp, s);
       si_indices_scan_i32[elwByteLog(xe)](tyany_ptr(x), rp, s);
     } else
