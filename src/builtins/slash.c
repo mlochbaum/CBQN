@@ -571,38 +571,32 @@ B slash_c1(B t, B x) {
   usz xia = IA(x);
   B r;
   u8 xe = TI(x,elType);
-  if (xe!=el_bit && s<=xia) x = squeeze_numTry(x, &xe, SQ_NUM);
+  if (xe!=el_bit && (s<=xia || xe>el_i32)) x = squeeze_numTry(x, &xe, SQ_NUM);
   if (xe==el_bit) {
     r = where(x, xia, s);
-  #if SINGELI
-  } else if (xe == el_i8) {
-    u8 t = (xia>128) + (xia>32768) + (xia > (usz)I32_MAX+1);
-    void* rv = m_tyarrv(&r, 1<<t, s, el2t(el_i8+t));
-    si_indices[t](tyany_ptr(x), rv, xia);
-  #endif
-  } else if (RARE(xia > (usz)I32_MAX+1)) {
-    SGetU(x)
-    f64* rp; r = m_f64arrv(&rp, s); usz ri = 0;
-    for (usz i = 0; i < xia; i++) {
-      usz c = o2s(GetU(x, i));
-      for (usz j = 0; j < c; j++) rp[ri++] = i;
-    }
-  } else if (RARE(xe > el_i32)) {
-    i32* rp; r = m_i32arrv(&rp, s);
-    SLOW1("/𝕩", x);
-    SGetU(x)
-    for (u64 i = 0; i < xia; i++) {
-      usz c = o2s(GetU(x, i));
-      for (u64 j = 0; j < c; j++) *rp++ = i;
-    }
   } else {
     #if SINGELI
-    if (s/32 <= xia) { // Sparse case: type of x matters
+    assert(elNum(xe));
+    u8 t = (xia>128) + (xia>32768) + (xia > (usz)I32_MAX+1);
+    void* rv = m_tyarrv(&r, 1<<t, s, el2t(el_i8+t));
+    si_indices[t](elwByteLog(xe), tyany_ptr(x), rv, xia);
+    #else
+    if (RARE(xia > (usz)I32_MAX+1)) {
+      SGetU(x)
+      f64* rp; r = m_f64arrv(&rp, s); usz ri = 0;
+      for (usz i = 0; i < xia; i++) {
+        usz c = o2s(GetU(x, i));
+        for (usz j = 0; j < c; j++) rp[ri++] = i;
+      }
+    } else if (RARE(xe > el_i32)) {
       i32* rp; r = m_i32arrv(&rp, s);
-      si_indices_scan_i32[elwByteLog(xe)](tyany_ptr(x), rp, s);
-    } else
-    #endif
-    { // Dense case: only result type matters
+      SLOW1("/𝕩", x);
+      SGetU(x)
+      for (u64 i = 0; i < xia; i++) {
+        usz c = o2s(GetU(x, i));
+        for (u64 j = 0; j < c; j++) *rp++ = i;
+      }
+    } else { // Dense case: only result type matters
       #define DENSE_IND(T) \
         T* rp; r = m_##T##arrv(&rp, s);          \
         for (u64 i = 0; i < xia; i++) {          \
@@ -617,6 +611,7 @@ B slash_c1(B t, B x) {
       else                   { DENSE_IND(i32); }
       #undef DENSE_IND
     }
+    #endif
   }
   decG(x);
   return r;

@@ -5,6 +5,7 @@ include './cbqnDefs'
 
 def ind_types = tup{u8, u16, u32}
 def dat_types = tup{...ind_types, u64}
+def arg_types = tup{i8, i16, i32, f64}
 
 # Indices and Replicate using plus- or max-scan
 def scan_core{upd, set, scan, rp:*T, wp:W, s:(usz)} = {
@@ -32,20 +33,6 @@ def indrep_by_sum{T, rp:*T, wp, s:(usz), js, inc} = {
   scan_core{upd, 0, scan, rp, wp, s}
 }
 
-fn ind_by_scan_i32{W}(xv:*void, rp:*i32, s:usz) : void = {
-  xp := *W~~xv
-  if (hasarch{'X86_64'} and not hasarch{'SSE4.1'}) { # no min instruction
-    js:i32 = 0
-    indrep_by_sum{i32, rp, xp, s, js, {j}=>1}
-  } else {
-    scan_core{
-      {rp,j,ij} => store{rp,ij,cast_i{i32,j}}, 1,
-      {ptr,len} => emit{void, 'si_scan_max_i32', ptr,ptr,len},
-      rp, xp, s
-    }
-  }
-}
-
 def rep_by_scan{T, wp, xv:(*void), rv:(*void), s} = {
   xp := *T~~xv; js := *xp; px := js
   def inc{j} = {sx:=px; px=load{xp,j}; px-sx}
@@ -55,7 +42,6 @@ fn rep_by_scan{W, T}(wp:*void, xv:*void, rv:*void, s:usz) : void = {
   rep_by_scan{T, *W~~wp, xv, rv, s}
 }
 
-export_tab{'si_indices_scan_i32', each{ind_by_scan_i32, ind_types}}
 export_tab{'si_replicate_scan', flat_table{rep_by_scan, ind_types, dat_types}}
 
 
@@ -143,21 +129,45 @@ fn indices_fill_buf(xp:*u8, buf:*u8, n:usz, s:usz) : usz = {
   s
 }
 
-def indices_init{T} = {
-  def bn = if (T==i8) 128 else 256
-  aux := talloc{u8, bn + ibuf_reserve{bn}}
-  buf := aux + bn
-  tup{ibuf_mod,bn,aux,buf}
+fn squash_counts{T}(xp:*void, o:usz, dst:*u8, n:usz) : *u8 = {
+  @for (xf in *T~~xp + o, dst over n) {
+    def x = if (T==f64) cast_i{u64,xf} else xf
+    dst = cast_i{u8, x&0x7f} | promote{u8,x>=0x80}<<7
+  }
+  dst
 }
-fn indices{T}(xp:*u8, rv:*void, xia:usz) : void = {
+fn squash_counts{(i8)}(xp:*void, o:usz, _:*u8, n:usz) = *u8~~xp + o
+def sqfns = each{squash_counts, arg_types}
+squash_counts_fns:*one_type{sqfns} = sqfns
+
+fn read_count{T}(xp:*void, o:usz) = cast_i{usz, load{*T~~xp, o}}
+def rcfns = each{read_count, arg_types}
+read_count_fns:*one_type{rcfns} = rcfns
+def read_count{xc:(*u8), xp:(*void), xk, i, off} = {
+  c := promote{usz, load{xc,i}}
+  if (rare{c >= 128}) c = load{read_count_fns, xk}(xp, off{i})
+  c
+}
+
+def indices_init{T, xk} = {
+  def bn = if (T==i8) 128 else 256
+  xn  := usz~~bn &- (xk>0)  # i8 is used in-place, others need space
+  xcp := talloc{u8, xn + (bn + ibuf_reserve{bn})}
+  aux := xcp + xn
+  buf := aux + bn
+  tup{ibuf_mod,bn,xcp,aux,buf}
+}
+fn indices{T}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
   # Scalar copy; aux handling isn't fast
-  def {wl,bn,aux,buf} = indices_init{T}
+  def {wl,bn,xcp,aux,buf} = indices_init{T, xk}
   res := *T~~rv; def out{xo} = { store{res, 0, xo}; ++res }
   o:T = 0; def off{x} = o + promote{T,x}
+  sq := load{squash_counts_fns, xk}
   do {
     n := xia; if (n>bn) n = bn
-    an := indices_fill_aux(xp, *u64~~buf, aux, n)
-    s  := indices_fill_buf(xp, buf, n, 0)
+    x  := sq(xp, cast_i{usz,o}, xcp, n)
+    an := indices_fill_aux(x, *u64~~buf, aux, n)
+    s  := indices_fill_buf(x, buf, n, 0)
     store{buf, s, 255}
     i:usz = 0
     if (an > 0) {
@@ -165,7 +175,9 @@ fn indices{T}(xp:*u8, rv:*void, xia:usz) : void = {
       while (1) {
         b := load{buf, i}
         while (rare{b >= a}) {
-          ao := off{a}; @for (load{xp, a} &~ (wl-1)) out{ao}
+          ao := off{a}
+          xv := read_count{x, xp, xk, a, {_}=>cast_i{usz,ao}}
+          @for (xv &~ (wl-1)) out{ao}
           ++ai; if (ai == an) goto{'aux_done'}
           a = load{aux, ai}
         }
@@ -177,11 +189,11 @@ fn indices{T}(xp:*u8, rv:*void, xia:usz) : void = {
     setlabel{'aux_done'}
     @for (b in buf over _ from i to s) out{off{b}}
     setlabel{'done'}
-    xia -= n; xp += bn; o += bn
+    xia -= n; o += bn
   } while (xia > 0)
-  tfree{aux}
+  tfree{xcp}
 }
-fn indices{T==i8}(xp:*u8, rv:*void, xia:usz) : void = {
+fn indices{T==i8}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
   # Copy with SWAR/SIMD min/max
   # Max length is 128, so no need for blocking
   def minmax{a, b} = tup{__min{a,b}, __max{a,b}}
@@ -196,9 +208,10 @@ fn indices{T==i8}(xp:*u8, rv:*void, xia:usz) : void = {
   def R = if (has_simd) [16]u8 else u64
   def vl = width{R}/8
 
-  def {wl,bn,aux,buf} = indices_init{T}; assert{vl <= wl}
-  an := indices_fill_aux(xp, *u64~~buf, aux, xia)
-  s  := indices_fill_buf(xp, buf, xia, 0)
+  def {wl,bn,xcp,aux,buf} = indices_init{T, xk}; assert{vl <= wl}
+  x  := load{squash_counts_fns, xk}(xp, 0, xcp, xia)
+  an := indices_fill_aux(x, *u64~~buf, aux, xia)
+  s  := indices_fill_buf(x, buf, xia, 0)
   b := *R~~buf; be := b + s/vl
   res := *R~~rv
   if (an > 0) {
@@ -208,7 +221,8 @@ fn indices{T==i8}(xp:*u8, rv:*void, xia:usz) : void = {
       bv := load{b}
       e := if (R==u64) cast_i{u8, bv >> (64-8)} else load{*u8~~b, vl-1}
       while (rare{a <= e}) { # expansion needed
-        xa := (load{xp, a} / wl) * (wl/vl)
+        xv := read_count{x, xp, xk, a, cast_i{usz,.}}
+        xa := (xv / wl) * (wl/vl)
         av := R**a
         def {mm,mx} = minmax{av, bv}
         out{mm}; bv = mx
@@ -223,14 +237,14 @@ fn indices{T==i8}(xp:*u8, rv:*void, xia:usz) : void = {
     s -= u64~~(*u8~~b - buf)
   }
   emit{void, 'memcpy', res, b, s}
-  tfree{aux}
+  tfree{xcp}
 }
-fn indices{T if T==i16 and hasarch{'AVX2'}}(xp:*u8, rv:*void, xia:usz) : void = {
-  def {wl,bn,aux,buf8} = indices_init{T}
+fn indices{T if T==i16 and hasarch{'AVX2'}}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
+  def {wl,bn,xcp,aux,buf8} = indices_init{T, xk}
   def vl = 16
   def B = [vl]u8; def R = [vl]ty_u{T}
   def W = [2*vl]u8
-  o := W**0
+  xo:usz = 0; o := W**0
   def z{v} = mzip128{v, o, 0}
   def off{v:(B)} = z{vec_select{u64, undef_promote{W,v}, tup{0,0,1,1}}}
   def off{0} = z{W**0}
@@ -238,11 +252,13 @@ fn indices{T if T==i16 and hasarch{'AVX2'}}(xp:*u8, rv:*void, xia:usz) : void = 
   buf := *B~~buf8
   res := *R~~rv; def out{v} = { store{res, 0, v}; ++res }
   s:usz = 0
+  sq := load{squash_counts_fns, xk}
   do {
     n := xia; if (n>bn) n = bn
-    an := indices_fill_aux(xp, *u64~~buf, aux, n)
+    x  := sq(xp, xo, xcp, n)
+    an := indices_fill_aux(x, *u64~~buf, aux, n)
     cx := (carry ^ off{0}) & mask_of_first{R, s}
-    s   = indices_fill_buf(xp, *u8~~buf, n, s)
+    s   = indices_fill_buf(x, *u8~~buf, n, s)
     rw0 := res
     b := buf; be := b + s/wl
     if (an == 0) {
@@ -260,7 +276,7 @@ fn indices{T if T==i16 and hasarch{'AVX2'}}(xp:*u8, rv:*void, xia:usz) : void = 
           out{carry}
         }
         while (rare{a <= e}) { # expansion needed
-          xa := load{xp, a} / wl
+          xa := read_count{x, xp, xk, a, {_}=>xo+promote{usz,a}} / wl
           av := B**a
           out{off{__min{av,bv}}}; bv = __max{av,bv}
           avo := off{av}; @for (i from 1 to xa) out{avo}
@@ -277,12 +293,12 @@ fn indices{T if T==i16 and hasarch{'AVX2'}}(xp:*u8, rv:*void, xia:usz) : void = 
     store{rw0, 0, load{rw0} ^ cx}
     s %= wl
     setlabel{'continue'}
-    xia -= n; xp += bn; o += W**1
+    xia -= n; xo += bn; o += W**1
   } while (xia > 0)
   store_blended_hom{res, mask_of_first{R, s}, carry}
-  tfree{aux}
+  tfree{xcp}
 }
-export_tab{'si_indices', each{indices, tup{i8,i16,i32,f64}}}
+export_tab{'si_indices', each{indices, arg_types}}
 
 
 # Constant replicate
