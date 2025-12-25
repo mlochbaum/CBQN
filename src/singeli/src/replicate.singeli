@@ -251,47 +251,90 @@ fn indices{T==i8}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
   emit{void, 'memcpy', res, b, s}
   tfree{aux}
 }
-fn indices{T if T==i16 and hasarch{'AVX2'}}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
-  def vl = 16
+fn indices{T if (T==i16 or T==i32) and has_simd}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
+  # Expand to write pairs of vectors
+  def U = ty_u{T}
+  def rl = arch_defvw{}/width{T}; def R = [rl]U
+  def vl = 2*rl  # length of most result writes: two vectors
+  def B = if (vl==8) u64 else [vl]u8  # type for buffer reads
+  def broadcast{(u64), n} = 64w0x01*n
   def {wl,bn,xi,aux,x,buf} = indices_init{T, xk, xp, vl}
-  def B = [vl]u8; def R = [vl]ty_u{T}
-  def W = [2*vl]u8
-  xo:usz = 0; o := W**0
-  def z{v} = mzip128{v, o, 0}
-  def off{v:(B)} = z{vec_select{u64, undef_promote{W,v}, tup{0,0,1,1}}}
-  def off{0} = z{W**0}
-  carry := R**0
-  res := *R~~rv; def out{v} = { store{res, 0, v}; ++res }
-  s:usz = 0
+  # If T==i16, read full vectors of u8 from the buffer
+  # If T==i32, read halves and immediately expand to full u16 vectors
+  def {o,inc_o,top_o, X, pre} = if (T==i16) {
+    def O = [vl]u8; o := O**0
+    def pre = if (vl>16) shuf{u64, ., 0,2,1,3} else ({x}=>x)
+    tup{o, {} => { o += O**1 }, {}=>mzip128{O**0,o,0}, B, pre}
+  } else {
+    def W = [2*vl]u8; def O = [vl]u16
+    ob := W**0; o := O**0
+    def inc_o{} = { ob += W**1; o += O~~(ob == W**0) & O**1 }
+    def pp = if (vl==8) {
+      {x} => W~~[2]u64**x  # top half not needed
+    } else {
+      def i = flat_table{+,tup{0,1},tup{0,2,0,2}}
+      {x} => shuf{u32, undef_promote{W,x}, i}
+    }
+    def top_o{} = mzip128{mzip128{W**0,ob,0},o,0}
+    tup{o, inc_o, top_o, [vl]u16, {x} => mzip128{pp{x}, ob, 0}}
+  }
+  def off{v:(X), ...e} = mzip128{v, o, ...e}
+  # Carry has to be full-width to store all the top bits
+  res := *R~~rv
+  def out{{...vs}} = { each{store{res,...}, iota{2}, vs}; res+=2 }
+  carry := @collect (2) R**0
+  vi := @collect (i to 2) make{R, rl*i + iota{rl}}
+  def mask_carry{carry, s} = {
+    ow := top_o{}
+    sv := R**cast_i{U,s}
+    each{{c,i} => (c^ow) & (i<sv), carry, vi}
+  }
+  s:usz = 0; xo:usz = 0
   squash := load{squash_counts_fns, xk}
   do {
     n := xia; if (n>bn) n = bn
     an := squash(xp, xo, x, aux, buf, n)
-    cx := (carry ^ off{0}) & mask_of_first{R, s}
+    cx := mask_carry{carry, s}
     store{*B~~buf, 0, B**0}
-    s   = indices_fill_buf(x, buf, n, s)
+    s = indices_fill_buf(x, buf, n, s)
     store{*B~~(buf+s), 0, B**255}
     rw0 := res
-    b := *B~~buf; be := b + s/wl
+    b := *B~~buf; be := b + s/vl
     if (an == 0) {
-      if (s < wl) { # no writes this block
-        carry = off{load{b}} ^ cx
+      if (s < vl) { # no writes this block
+        carry = each{^, off{pre{load{b}}}, cx}
         goto{'continue'}
       }
     } else {
       ai:usz = 0; a := load{aux, ai}
       while (1) {
-        bv := load{b}; e := load{*u8~~b,vl-1}; ++b
+        bv := pre{load{b}}; e := load{*u8~~b,vl-1}; ++b
         def fin{} = {
           carry = off{bv}
           if (b > be) goto{'finish_block'}
           out{carry}
         }
         while (rare{a <= e}) { # expansion needed
+          def out{v:(R)} = { store{res, 0, v}; ++res }
           xa := read_count{x, xp, xk, a, {_}=>xo+promote{usz,a}} / wl
-          av := B**a
-          out{off{__min{av,bv}}}; bv = __max{av,bv}
-          avo := off{av}; @for (i from 1 to xa) out{avo}
+          av := X**a
+          am := __min{av,bv}; bv = __max{av,bv}
+          if (vl <= wl) {
+            out{off{am}}
+            ao := off{av,0}; @for (_ from 1 to xa*(wl/vl)) @unroll (2) out{ao}
+          } else {
+            # Single-vector writes
+            assert{vl == 2*wl}
+            out{off{am,0}}
+            if (xa<2) {
+              # First half of bv overlaps am
+              # Shuffle lane-wise: pre{} already put values in the right lanes
+              bv = blend_hom{shuf{f64, tup{am,bv}, 1,1}, bv, bv>av}
+            } else {
+              out{off{am,1}}
+              ao := off{av,0}; @for (_ from 2 to xa) out{ao}
+            }
+          }
           ++ai; if (ai == an) { fin{}; goto{'aux_done'} }
           a = load{aux, ai}
         }
@@ -299,15 +342,17 @@ fn indices{T if T==i16 and hasarch{'AVX2'}}(xk:u8, xp:*void, rv:*void, xia:usz) 
       }
     }
     setlabel{'aux_done'} # fast path when remainder is bounded
-    @for (b over be-b) out{off{b}}
-    carry = off{load{be}}
+    @for (b over be-b) out{off{pre{b}}}
+    carry = off{pre{load{be}}}
     setlabel{'finish_block'}
-    store{rw0, 0, load{rw0} ^ cx}
-    s %= wl
+    @unroll (rw0 over i to 2) rw0 ^= select{cx,i}
+    s %= vl
     setlabel{'continue'}
-    xia -= n; xo += bn; x += xi; o += W**1
+    xia -= n; xo += bn; x += xi; inc_o{}
   } while (xia > 0)
-  store_blended_hom{res, mask_of_first{R, s}, carry}
+  def {c0, c1} = carry
+  if (s > rl) { store{res, 0, c0}; c0 = c1; ++res; s-=rl }
+  store_blended_hom{res, mask_of_first{R, s}, c0}
   tfree{aux}
 }
 export_tab{'si_indices', each{indices, arg_types}}
