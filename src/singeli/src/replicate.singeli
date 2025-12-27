@@ -126,6 +126,7 @@ fn squash_counts{T if has_simd and T<=i32}(xp:*void, o:usz, dst:*u8, aux:*u8, bu
         ty_u{__min{x,V**0x80} | x} & ty_u{V}**0xff
       }
       def packs{x} = x
+      def packs{a, b if hasarch{'AARCH64'}} = pack{a, b, 0}
       def packs{a:V==[4]u32, b:V if hasarch{'X86_64'} and not hasarch{'SSE4.1'}} = { def U=re_el{u16,V}; U~~packs{U~~a,U~~b} }
       narrow{u8, packs{...xs}}
     }
@@ -142,7 +143,7 @@ fn squash_counts{T if has_simd and T<=i32}(xp:*void, o:usz, dst:*u8, aux:*u8, bu
     store{bw,i, load{bw,i} & ((u64~~1<<(n%64)) - 1)}
   }
   @for (v in bw over i to cdiv{n, 64}) while (v!=0) {
-    store{aux, an, cast_i{u8, i*64 + ctz{v}}}; ++an; v&=v-1
+    store{aux, an, cast_i{u8, i*64 + cast_i{usz,ctz{v}}}}; ++an; v&=v-1
   }
   an
 }
@@ -259,7 +260,7 @@ fn indices{T==i8}(xk:u8, xp:*void, rv:*void, xia:usz) : void = {
       out{bv}; ++b
     }
     setlabel{'break'}
-    s -= u64~~(*u8~~b - buf)
+    s -= cast_i{usz, *u8~~b - buf}
   }
   emit{void, 'memcpy', res, b, s}
   tfree{aux}
