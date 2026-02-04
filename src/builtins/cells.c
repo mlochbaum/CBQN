@@ -14,7 +14,6 @@ B select_c2(B, B, B);
 
 // from fold.c:
 B fold_rows(Md1D* d, B x, usz n, usz m);
-B fold_rows_bit(Md1D* d, B x, usz n, usz m);
 B insert_cells_join(B x, usz* xsh, ur cr, ur k);
 B insert_cells_identity(B x, B f, usz* xsh, ur xr, ur k, u8 rtid);
 
@@ -531,19 +530,10 @@ B for_cells_c1(B f, u32 xr, u32 cr, u32 k, B x, u32 chr) { // F⎉cr x; array x,
           if (m==1 || frtid==n_ltack) return select_cells(0  , x, xr, cam, k);
           if (        frtid==n_rtack) return select_cells(m-1, x, xr, cam, k);
           if (isPervasiveDyExt(fd->f) && 1==shProd(xsh, k+1, xr)) {
-            B r;
-            // special cases always return rank 1
+            // fold_rows always returns rank 1
             // incG(x) preserves the shape to restore afterwards if needed
-            if (TI(x,elType)==el_bit) {
-              incG(x); r = fold_rows_bit(fd, x, cam, m);
-              if (q_N(r)) decG(x); // will try fold_rows
-              else goto finish_fold;
-            }
-            if (m<=64 && m<cam) {
-              incG(x); r = fold_rows    (fd, x, cam, m);
-            }
-            else break;
-            finish_fold:
+            incG(x); B r = fold_rows(fd, x, cam, m);
+            if (q_N(r)) { decG(x); break; }
             if (xr > 2) {
               usz* rsh = arr_shAlloc(a(r), xr-1);
               shcpy(rsh, xsh, k);

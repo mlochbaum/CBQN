@@ -693,44 +693,6 @@ B insert_cells_identity(B x, B f, usz* xsh, ur xr, ur k, u8 rtid) {
   decG(x); return taga(r);
 }
 
-// Arithmetic fold/insert on -k-cells of flat array x
-// Return a vector regardless of argument shape
-B transp_c1(B, B);
-B fold_rows(Md1D* fd, B x, usz n, usz m) {
-  assert(isArr(x) && IA(x)==n*m);
-  // Target block size trying to avoid power-of-two lengths, from:
-  // {𝕩/˜⌊´⊸= +˝˘ +˝¬∨`2|>⌊∘÷⟜2⍟(↕12) ⌊0.5+32÷˜𝕩÷⌜1+↕64} +⟜↕2⋆16
-  u64 block = (116053*8) >> arrTypeBitsLog(TY(x));
-  if (TI(x,elType)==el_bit || IA(x)/2 <= block) {
-    if (RNK(x) > 2) {
-      Arr* xc = cpyWithShape(x);
-      ShArr* sh = m_shArr(2);
-      sh->a[0] = n; sh->a[1] = m;
-      x = taga(arr_shReplace(xc, 2, sh));
-    }
-    x = C1(transp, x);
-    return insert_c1(fd, x);
-  } else {
-    usz b = (block + m - 1) / m; // Normal block length
-    usz b_max = b + b/4;         // Last block max length
-    MAKE_MUT(r, n); MUT_APPEND_INIT(r);
-    BSS2A slice = TI(x,slice);
-    for (usz i=0, im=0; i<n; ) {
-      usz l = n-i; if (l > b_max) { incG(x); l = b; }
-      usz sia = l * m;
-      Arr* sl = slice(x, im, sia);
-      usz* ssh = arr_shAlloc(sl, 2);
-      ssh[0] = l;
-      ssh[1] = m;
-      B sr = insert_c1(fd, C1(transp, taga(sl)));
-      MUT_APPEND(r, sr, 0, l);
-      decG(sr);
-      i += l; im += sia;
-    }
-    return mut_fv(r);
-  }
-}
-
 B sum_rows_bit(B x, usz n, usz m) {
   u64* xp = bitany_ptr(x);
   if (m < 128) {
@@ -798,34 +760,95 @@ B sum_rows_bit(B x, usz n, usz m) {
   }
 }
 
+// Arithmetic fold/insert on -k-cells of flat array x
 // Fold n cells of size m, stride 1
-// Return a vector regardless of argument shape, or bi_N if not handled
-B fold_rows_bit(Md1D* fd, B x, usz n, usz m) {
-  assert(isArr(x) && TI(x,elType)==el_bit && IA(x)==n*m);
-  if (RTID(fd->f) == RTID_NONE) return bi_N;
+// Return a vector regardless of argument shape
+B transp_c1(B, B);
+B fold_rows(Md1D* fd, B x, usz n, usz m) {
+  assert(isArr(x) && IA(x)==n*m);
+  u8 xe = TI(x,elType);
   u8 rtid = RTID(fd->f);
-  if (rtid==n_add) return sum_rows_bit(x, n, m);
-  #if SINGELI
-  bool is_or = rtid==n_or |rtid==n_ceil;
-  bool andor = rtid==n_and|rtid==n_floor|rtid==n_mul|is_or;
-  if (rtid==n_ne|rtid==n_eq|andor) {
-    if (n==0) { decG(x); return taga(arr_shVec(allZeroes(0))); }
-    if (andor && m < 256) while (m%8 == 0) {
-      usz f = CTZ(m|32);
-      m >>= f; usz c = m*n;
-      u64* yp; B y = m_bitarrv(&yp, c);
-      u8 e = el_i8 + f-3;
-      CmpASFn cmp = is_or ? CMP_AS_FN(ne, e) : CMP_AS_FN(eq, e);
-      CMP_AS_CALL(cmp, yp, bitany_ptr(x), m_f64(is_or-1), c);
-      decG(x); if (m==1) return y;
-      x = y;
+  if (xe == el_bit) {
+    if (rtid==n_add) return sum_rows_bit(x, n, m);
+    #if SINGELI
+    bool is_or = rtid==n_or |rtid==n_ceil;
+    bool andor = rtid==n_and|rtid==n_floor|rtid==n_mul|is_or;
+    if (rtid==n_ne|rtid==n_eq|andor) {
+      if (n==0) { decG(x); return taga(arr_shVec(allZeroes(0))); }
+      if (andor && m < 256) while (m%8 == 0) {
+        usz f = CTZ(m|32);
+        m >>= f; usz c = m*n;
+        u64* yp; B y = m_bitarrv(&yp, c);
+        u8 e = el_i8 + f-3;
+        CmpASFn cmp = is_or ? CMP_AS_FN(ne, e) : CMP_AS_FN(eq, e);
+        CMP_AS_CALL(cmp, yp, bitany_ptr(x), m_f64(is_or-1), c);
+        decG(x); if (m==1) return y;
+        x = y;
+      }
+      u64* xp = bitany_ptr(x);
+      u64* rp; B r = m_bitarrv(&rp, n);
+      if (andor) si_or_rows_bit(xp, rp, n, m, !is_or);
+      else      si_xor_rows_bit(xp, rp, n, m, rtid==n_eq);
+      decG(x); return r;
     }
-    u64* xp = bitany_ptr(x);
-    u64* rp; B r = m_bitarrv(&rp, n);
-    if (andor) si_or_rows_bit(xp, rp, n, m, !is_or);
-    else      si_xor_rows_bit(xp, rp, n, m, rtid==n_eq);
-    decG(x); return r;
+    #endif
+  } else if (elNum(xe) && (rtid==n_floor|rtid==n_ceil|rtid==n_add|rtid==n_mul|rtid==n_and)
+                       && m*elWidth(xe)>=128) {
+    usz mb = m * elWidth(xe);
+    f64* rp; B r = m_f64arrv(&rp, n);
+    u8* xp = tyany_ptr(x);
+    switch (rtid) { default: UD;
+      case n_floor: case n_ceil: {
+        f64 (*fold_row)(void*, usz);
+        fold_row = (rtid==n_floor? min_fns : max_fns)[xe-el_i8];
+        for (usz i=0; i<n; i++, xp+=mb) rp[i] = fold_row(xp, m);
+        break;
+      }
+      case n_add: if (xe<=el_i32 & m<=sum_small_max) {
+        i64 (*fold_row)(void*, usz) = sum_small_fns[xe-el_i8];
+        for (usz i=0; i<n; i++, xp+=mb) rp[i] = fold_row(xp, m);
+        break;
+      } // else fall through
+      case n_mul: case n_and: {
+        f64 (*fold_row)(void*, usz, f64);
+        fold_row = (rtid==n_add? sum_fns : prod_fns)[xe-el_i8];
+        f64 init = rtid!=n_add;
+        for (usz i=0; i<n; i++, xp+=mb) rp[i] = fold_row(xp, m, init);
+        break;
+      }
+    }
+    decG(x); return squeeze_numNewTy(el_f64, r);
   }
-  #endif
-  return bi_N;
+  // Generic case with transpose
+  // Target block size trying to avoid power-of-two lengths, from:
+  // {𝕩/˜⌊´⊸= +˝˘ +˝¬∨`2|>⌊∘÷⟜2⍟(↕12) ⌊0.5+32÷˜𝕩÷⌜1+↕64} +⟜↕2⋆16
+  u64 block = (116053*8) >> arrTypeBitsLog(TY(x));
+  if (TI(x,elType)==el_bit || IA(x)/2 <= block) {
+    if (RNK(x) > 2) {
+      Arr* xc = cpyWithShape(x);
+      ShArr* sh = m_shArr(2);
+      sh->a[0] = n; sh->a[1] = m;
+      x = taga(arr_shReplace(xc, 2, sh));
+    }
+    x = C1(transp, x);
+    return insert_c1(fd, x);
+  } else {
+    usz b = (block + m - 1) / m; // Normal block length
+    usz b_max = b + b/4;         // Last block max length
+    MAKE_MUT(r, n); MUT_APPEND_INIT(r);
+    BSS2A slice = TI(x,slice);
+    for (usz i=0, im=0; i<n; ) {
+      usz l = n-i; if (l > b_max) { incG(x); l = b; }
+      usz sia = l * m;
+      Arr* sl = slice(x, im, sia);
+      usz* ssh = arr_shAlloc(sl, 2);
+      ssh[0] = l;
+      ssh[1] = m;
+      B sr = insert_c1(fd, C1(transp, taga(sl)));
+      MUT_APPEND(r, sr, 0, l);
+      decG(sr);
+      i += l; im += sia;
+    }
+    return mut_fv(r);
+  }
 }
